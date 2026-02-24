@@ -87,9 +87,6 @@ def ridge_gridcv(df, fld='Ex', pth='', name=None, fi_plts=True,
     plt.savefig("ridge_grid_score_vs_alpha.pdf", bbox_inches='tight')
 
     
-    
-    
-    
     # Compute and print the metrics
     print(f"Tuned Ridge Alpha: {gm_cv.best_params_}")
     print(f"Tuned Ridge Score: {gm_cv.score(X_test, y_test)}")
