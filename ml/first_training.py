@@ -4,34 +4,8 @@ from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import ToTensor
 
-# Define a simple neural network
-
 device = "cpu"
 print(f"Using {device} device")
-
-# Define model
-class NeuralNetwork(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.linear_relu_stack = nn.Sequential(
-            nn.Linear(28*28, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 10)
-        )
-
-    def forward(self, x):
-        x = self.flatten(x)
-        logits = self.linear_relu_stack(x)
-        return logits
-
-model = NeuralNetwork().to(device)
-print(model)
-
-#To train a model, we need a loss function and an optimizer.
-
 # loss_fn = nn.CrossEntropyLoss()
 # optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
 
@@ -58,20 +32,7 @@ from sklearn import svm # SVM
 from sklearn.neighbors import KNeighborsClassifier # KNN
 from sklearn import metrics # check model accuracy
 from sklearn.model_selection import train_test_split  # split data into train & test
-
-#### CV data
-import torchvision
-data = torchvision.datasets.FashionMNIST(root='data', train=True, download=True)
-
-# preprocess the data into numpy arrays
-images = data.data.numpy().astype(float)
-targets = data.targets.numpy() # integer encoding of class labels
-class_dict = {i:class_name for i,class_name in enumerate(data.classes)}
-labels = np.array([class_dict[t] for t in targets]) # raw class labels
-n = len(images)
-
-import pandas as pd
-import h5py
+import yt 
 
 file_path = '/scratch/mlaidler/astr_thesis/mhd_1e8/1E25_S100_z01_mhd/Simulation/ISM_hdf5_chk_0004'
 
@@ -174,37 +135,43 @@ def extract_final_targets(ds):
         "T_std_final":   T.std().value,
     }
 
-import yt
-import pandas as pd
 from pathlib import Path
 
-base_dir = Path("/scratch/mlaidler/astr_thesis/mhd_1e8/1E25_S100_z01_mhd/Simulation")
+base_dir = "/scratch/mlaidler/astr_thesis/mhd_1e8/1E25_S100_z01_mhd/Simulation/"
 rows = []
 
-for run_dir in base_dir.iterdir():
-    if not run_dir.is_dir():
-        continue
+chk4_files = base_dir + "ISM_hdf5_chk_0004"
+chk22_files = base_dir + "ISM_hdf5_chk_0017"
 
-    try:
-        early_ds = yt.load(run_dir / f"ISM_hdf5_chk_0004")
-        final_ds = yt.load(run_dir / f"ISM_hdf5_chk_0022")
+# make sure I have files
 
-        row = {}
-        row.update(extract_early_features(early_ds))
-        row.update(extract_final_targets(final_ds))
+if not chk4_files or not chk22_files:
+    print("Checkpoint files not found!")
 
-        row["run_name"] = run_dir.name
+else:
+    early_ds = yt.load(chk4_files)
+    final_ds = yt.load(chk22_files)
+
+    row = {}
+
+    # Extract numeric fields from early_ds
+    for field in early_ds.field_list:
+        row[f"early_{field[1]}"] = early_ds.all_data()[field].mean()
+            # Extract numeric fields from final_ds
+    for field in final_ds.field_list:
+        row[f"final_{field[1]}"] = final_ds.all_data()[field].mean()
+
+            # Keep track of run
+        s = len(base_dir)
         rows.append(row)
-
-        print(f"Processed {run_dir.name}")
-
-    except Exception as e:
-        print(f"Skipping {run_dir.name}: {e}")
+        print(f"Processed {chk4_files[s:]}")
 
 df = pd.DataFrame(rows)
 
-print(df.head())
-print(df.describe())
+print("num of rows :", len(rows))
+print("rows: ", rows[:2])
+print("columns: ", df.columns)
+print("df.head(): ", df.head())
 print(df.isna().sum())
 
 from sklearn.model_selection import train_test_split
@@ -215,17 +182,22 @@ train_df, test_df = train_test_split(
     random_state=42
 )
 
-target = ['rho_max_final', 'T_mean_final', 'T_std_final']
+target = ['final_temp', 'final_velx']
 
+# Split features / targets
 xtrain_df = train_df.drop(columns=target)
 ytrain_df = train_df[target]
 
 xtest_df = test_df.drop(columns=target)
 ytest_df = test_df[target]
 
+# 🔑 DROP NON-NUMERIC COLUMNS HERE
+xtrain_df = xtrain_df.select_dtypes(include='number')
+xtest_df  = xtest_df.select_dtypes(include='number')
+
 import matplotlib.pyplot as plt
 
-plt.scatter(df["rho_mean_early"], df["rho_max_final"])
+plt.scatter(df["early_temp"], df["final_temp"])
 plt.xlabel("Early Mean Density")
 plt.ylabel("Final Max Density")
 plt.show()
@@ -234,8 +206,9 @@ plt.show()
 
 from sklearn.linear_model import Ridge
 model = Ridge(alpha=1.0)
-
+print("started model: ridge")
 model.fit(xtrain_df, ytrain_df)
+print("fitting...next")
 y_pred = model.predict(xtest_df)
 
 
