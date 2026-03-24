@@ -4,6 +4,14 @@ from pathlib import Path
 
 import numpy as np
 
+#Keys in the dataset:
+# 'fe ', 'lfl ', 'lh  ', 'lhe ', 'lmg ', 'ln  ', 'lna ', 'lne ', 'lo  ', 'logical runtime parameters', 'logical scalars', 
+# 'lph ', 'ls  ', 'lsi ', 'magp', 'magx', 'magy', 'magz', 'metl', 'mg  ', 'mg2p', 'mg3p', 'mgp ', 'mode', 'n   ', 'n2p ', 
+# 'n3p ', 'n4p ', 'n5p ', 'n6p ', 'na  ', 'na2p', 'nap ', 'ne  ', 'ne2p', 'ne3p', 'ne4p', 'ne5p', 'ne6p', 'ne7p', 'ne8p', 
+# 'ne9p', 'nep ', 'node type', 'np  ', 'o   ', 'o2p ', 'o3p ', 'o4p ', 'o5p ', 'o6p ', 'o7p ', 'oden', 'op  ', 'otmp', 
+# 'ouphases', 'pres', 'processor number', 'randseed', 'real runtime parameters', 'real scalars', 'refine level', 's   ', 
+# 's2p ', 's3p ', 's4p ', 'shok', 'si  ', 'si2p', 'si3p', 'si4p', 'si5p', 'sim info', 'sip ', 'sp  ', 'string runtime parameters', 
+# 'string scalars', 'temp', 'unknown names', 'velx', 'vely', 'velz'
 
 # #Field list for reference 
 # field list: [('flash', 'accx'), ('flash', 'accy'), ('flash', 'accz'), ('flash', 'c   '), 

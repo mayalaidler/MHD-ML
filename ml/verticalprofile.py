@@ -9,26 +9,9 @@ from glob import glob
 from typing import Tuple, List
 from sklearn.preprocessing import StandardScaler
 
-
-#df15 = gen_df_tave(fname='mhd_dataset.npz',t1=1500,t2=-1,verbose=0)
-
-# def read_mf_norm(fname='mfields.npz'):
-#     # Normalize everything by urms = B_eq
-#     mf = np.load(fname)
-#     bxm = mf['bxm']/mf['uave']
-#     bym = mf['bym']/mf['uave']
-#     jxm = mf['jxm']/mf['uave']
-#     jym = mf['jym']/mf['uave']
-#     Exm = mf['emfx']/mf['uave']
-#     Eym = mf['emfy']/mf['uave']
-#     return bxm, bym, jxm, jym, Exm, Eym
-
-#hdf5 to pd instead of npz to pd
-#fname = '/scratch/mlaidler/astr_thesis/mhd_1e8/1E25_S100_z01_mhd/Simulation/ISM_hdf5_chk_0004'
-
 def read_mf_norm(
     file_pattern: str = None,
-    cache_file: str = "meanfields.npz",
+    cache_file: str = "datasets/meanfields.npz",
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -150,7 +133,7 @@ def ave_t(arr,tone,ttwo,verbose=None):
         print(f't1: {tone}, t2: {ttwo}')
     return np.mean(arr[tone:ttwo,:],axis=0)
 
-def gen_df_tave(file_pattern,t1=5,t2=-1,verbose=None, cache_file: str = "meanfields.npz"):
+def gen_df_tave(file_pattern,t1=5,t2=-1,verbose=None, cache_file: str = "datasets/meanfields.npz"):
     '''
     Generate a dataframe by averaging squared fields over t from t1 to t2
     '''
@@ -171,12 +154,15 @@ def gen_df_tave(file_pattern,t1=5,t2=-1,verbose=None, cache_file: str = "meanfie
         'Ey': -1. * ave_t(Eym,tone=t1,ttwo=t2)  # Since PENCIL computes -VxB
         })
 
+ #Named like this -> Mass-dens_turbulent-velocity_metallcity
+file_pattern = '/scratch/ebuie/ISO_Turb/midway/mhd_1e8/1E23_S100_z01_mhd'
+#want to add a column in the dataframe for the Mass-dens, turbulent-velocity, and metallicity.
+#for inputs, magnetic fields velocities, mass densities, temperatures, and for output, Si IV mass fraction
 
-df15 = gen_df_tave(file_pattern='/scratch/mlaidler/astr_thesis/mhd_1e8/1E25_S100_z01_mhd/Simulation/ISM_hdf5_chk*',t1=5,t2=-1,verbose=1)
+df15 = gen_df_tave(file_pattern='/scratch/mlaidler/astr_thesis/mhd_1e8/1E25_S100_z01_mhd/Simulation/ISM_hdf5_chk*',t1=1,t2=-1,verbose=1)
 print("printing the averaged dataframe:")
 print(df15.head())
 print("Dataframe shape:", df15.shape)
-
 
 #linear regression
 from sklearn.linear_model import LinearRegression
@@ -187,7 +173,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error #mean_squared_error
 
 #from preprocess of M2
-def train_test_seq(X,y,test_size=0.2):
+def train_test_seq(X,y,test_size):
     '''
     Assume X,y are dataframes
     '''
@@ -205,7 +191,7 @@ lr = LinearRegression(fit_intercept=False)
 
 fld  = ['Ex']
 flds = ['Ex','Ey']
-tst_sz = 0.2
+tst_sz = 0.3
 
 df15_ss, scl = scale_df(df15)
 X_train_lr, X_test_lr, y_train_lr, y_test_lr = train_test_seq(df15_ss.drop(flds,axis=1),df15_ss[fld],test_size=tst_sz)

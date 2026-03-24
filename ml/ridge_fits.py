@@ -25,7 +25,7 @@ def ridge_gridcv(df, fld='Ex', pth='', name=None, fi_plts=True,
     from sklearn.pipeline import Pipeline
     from sklearn.metrics import mean_absolute_error #mean_squared_error
     
-    tst_sz = test_size if test_size is not None else 0.2
+    tst_sz = test_size if test_size is not None else 0.3
     totsz = df.shape[0]  
     train_size = 1 - tst_sz
 
