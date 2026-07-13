@@ -1,56 +1,40 @@
-# import torch
-# from torch import nn
-# from torch.utils.data import DataLoader
-# from torchvision import datasets
-# from torchvision.transforms import ToTensor
-
-import plotly.express as px
-import matplotlib.pyplot as plt
-import statsmodels.api as sm
-import sklearn as sk
-from sklearn.datasets import load_iris
-from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn import svm # SVM
-from sklearn.neighbors import KNeighborsClassifier # KNN
-from sklearn import metrics # check model accuracy
-from sklearn.model_selection import train_test_split  # split data into train & test
-import yt 
-
+# Fixed Ridge training — stricter spatial hold-out, si field only
 import os
-import re
 import numpy as np
-import pandas as pd
-import h5py
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_squared_error
-from sklearn.preprocessing import StandardScaler
 import joblib
+import yt
+import re
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.linear_model import RidgeCV
+from sklearn.metrics import mean_squared_error, r2_score
 
+USE_POLYNOMIAL_FEATURES = True  # Set True for polynomial degree-2 expansion
+POLY_DEGREE = 2
 
-# Train Si IV mass fraction from early checkpoint features.
+# Target ion: 'si  '=Si I (neutral), 'sip '=Si II, 'si2p'=Si III, 'si3p'=Si IV
+# Override with e.g.:  ION_FIELD='sip ' python3 si_model.py
+ION_FIELD = os.environ.get("ION_FIELD", "si  ")
+ION_TAG   = {"si  ": "SiI", "sip ": "SiII", "si2p": "SiIII", "si3p": "SiIV"}.get(
+    ION_FIELD, ION_FIELD.strip())
 
-# Inputs (early checkpoint ISM_hdf5_chk_0004):
-# - gas:density
-# - gas:temperature
-# - gas:velocity_x, velocity_y, velocity_z
-# - flash:magx/magy/magz or flash:mag_strength
+# Spatial split strategy — choose one:
+#   'percentile' — train on x < 25th, test on x > 75th (largest gap, least leakage)
+#   'median'     — train on x < 50th, test on x >= 50th (original, more leakage)
+#   'thirds'     — train on x < 33rd, test on x > 67th (middle ground)
+SPATIAL_SPLIT_STRATEGY = 'median'
 
-# Target (final checkpoint ISM_hdf5_chk_0017):
-# - Si IV mass fraction (attempts to locate common names such as
-#   ('flash','si4p'), ('flash','si4'), ('flash','si')).
+# ══════════════════════════════════════════════════════════════════════════════
 
-# The script samples up to 20k cells, trains a Ridge regressor, and
-# saves model weights to `si4_ridge_model.npz` in the simulation folder.
+def get_chk_number(path):
+    match = re.search(r"chk_(\d+)", path)
+    return int(match.group(1)) if match else -1
 
 def find_field(ds, substrings):
-    fl = ds.field_list
-    for field in fl:
+    for field in ds.field_list:
         fname = f"{field[0]}:{field[1]}".lower()
         if all(s.lower() in fname for s in substrings):
             return field
     return None
-
 
 def quantity_to_numpy(q):
     try:
@@ -58,203 +42,311 @@ def quantity_to_numpy(q):
     except Exception:
         return np.array(q)
 
+def build_dataset_with_coords(ds):
+    """Build dataset using ONLY the 'si  ' field (2 spaces)."""
+    rho_field  = find_field(ds, ('flash', 'dens'))
+    temp_field = find_field(ds, ('flash', 'temp'))
+    vx_field   = find_field(ds, ('flash', 'velx'))
+    vy_field   = find_field(ds, ('flash', 'vely'))
+    vz_field   = find_field(ds, ('flash', 'velz'))
+    si_field   = find_field(ds, ('flash', ION_FIELD))
 
-def main():
-    base_dir = "/scratch/mlaidler/astr_thesis/mhd_1e8/1E25_S100_z01_mhd/Simulation/"
-    early_chk = os.path.join(base_dir, "ISM_hdf5_chk_0017")
-
-    if not os.path.exists(early_chk):
-        raise FileNotFoundError(f"Early checkpoint not found: {early_chk}")
-
-    print(f"Loading early checkpoint: {early_chk}")
-    early_ds = yt.load(early_chk)
-
-    # locate Si field in the early dataset (we only use the early snapshot)
-    si_field = ('flash', 'si  ')
     if si_field is None:
-        available = ",".join(f"{f[0]}:{f[1]}" for f in early_ds.field_list)
-        raise RuntimeError(f"Could not locate Si IV field in early dataset. Available fields: {available}")
+        raise RuntimeError(f"Could not find ('flash', {ION_FIELD!r}) field in dataset")
 
-    print(f"Using Sitarget field from late checkpoint: {si_field}")
-
-    early_ad = early_ds.all_data()
-
-    # required early fields
-    req = [ ('flash', 'dens'), ('flash', 'temp'), ("flash","velx"), ("flash","vely"), ("flash","velz") ]
-    for r in req:
-        if r not in early_ds.field_list:
-            raise RuntimeError(f"Required early field missing: {r}")
-
-    # magnetic field
-    if ("flash","mag_strength") in early_ds.field_list:
-        B_field = ("flash","mag_strength")
+    # Magnetic field
+    if find_field(ds, ("mag_strength",)):
+        B_field = find_field(ds, ('flash', 'mag_strength'))
+        use_mag_components = False
     else:
-        comps = [("flash","magx"), ("flash","magy"), ("flash","magz")]
-        if all(c in early_ds.field_list for c in comps):
-            B_field = None
-        else:
-            B_field = None
+        Bx_field = find_field(ds, ('flash', 'magx'))
+        By_field = find_field(ds, ('flash', 'magy'))
+        Bz_field = find_field(ds, ('flash', 'magz'))
+        use_mag_components = True
 
-    rho = quantity_to_numpy(early_ad[("gas","density")])
-    T = quantity_to_numpy(early_ad[("gas","temperature")])
-    vx = quantity_to_numpy(early_ad[("gas","velocity_x")])
-    vy = quantity_to_numpy(early_ad[("gas","velocity_y")])
-    vz = quantity_to_numpy(early_ad[("gas","velocity_z")])
+    ad = ds.all_data()
 
-    if B_field is not None:
-        B = quantity_to_numpy(early_ad[B_field])
+    rho = np.ravel(quantity_to_numpy(ad[rho_field]))
+    T   = np.ravel(quantity_to_numpy(ad[temp_field]))
+    vx  = np.ravel(quantity_to_numpy(ad[vx_field]))
+    vy  = np.ravel(quantity_to_numpy(ad[vy_field]))
+    vz  = np.ravel(quantity_to_numpy(ad[vz_field]))
+
+    if use_mag_components:
+        Bx = np.ravel(quantity_to_numpy(ad[Bx_field]))
+        By = np.ravel(quantity_to_numpy(ad[By_field]))
+        Bz = np.ravel(quantity_to_numpy(ad[Bz_field]))
+        B  = np.sqrt(Bx**2 + By**2 + Bz**2)
     else:
-        Bx = quantity_to_numpy(early_ad[("flash","magx")])
-        By = quantity_to_numpy(early_ad[("flash","magy")])
-        Bz = quantity_to_numpy(early_ad[("flash","magz")])
-        B = np.sqrt(Bx**2 + By**2 + Bz**2)
+        B = np.ravel(quantity_to_numpy(ad[B_field]))
 
-    si = quantity_to_numpy(early_ad[si_field])
+    si    = np.ravel(quantity_to_numpy(ad[si_field]))
+    x_pos = np.ravel(quantity_to_numpy(ad[('index', 'x')]))
 
-    rho = np.ravel(np.array(rho, dtype=float))
-    T = np.ravel(np.array(T, dtype=float))
-    vx = np.ravel(np.array(vx, dtype=float))
-    vy = np.ravel(np.array(vy, dtype=float))
-    vz = np.ravel(np.array(vz, dtype=float))
-    B = np.ravel(np.array(B, dtype=float))
-    si = np.ravel(np.array(si, dtype=float))
+    # Align lengths
+    npts = min(len(rho), len(T), len(vx), len(vy), len(vz), len(B), len(si), len(x_pos))
+    rho, T, vx, vy, vz, B, si, x_pos = (
+        arr[:npts] for arr in (rho, T, vx, vy, vz, B, si, x_pos)
+    )
 
-    npts = min(len(rho), len(T), len(vx), len(B), len(si))
-    if npts == 0:
-        raise RuntimeError("No data points found in dataset arrays")
+    # Valid data mask
+    mask = (
+        np.isfinite(rho) & np.isfinite(T) & np.isfinite(vx) & 
+        np.isfinite(B) & np.isfinite(si) & np.isfinite(x_pos) & 
+        (si > 0) & (rho > 0) & (T > 0) & (B > 0)
+    )
 
-    N_SAMPLES = min(50000, npts)
-    rng = np.random.default_rng(42)
-    x = quantity_to_numpy(early_ad[("index", "x")])
-    ycoord = quantity_to_numpy(early_ad[("index", "y")])
-    z = quantity_to_numpy(early_ad[("index", "z")])
+    rho, T, vx, vy, vz, B, si, x_pos = (
+        arr[mask] for arr in (rho, T, vx, vy, vz, B, si, x_pos)
+    )
 
-    x = np.ravel(x)
-    ycoord = np.ravel(ycoord)
-    z = np.ravel(z)
+    # Feature engineering
+    eps = 1e-30
+    vmag = np.sqrt(vx**2 + vy**2 + vz**2)
+    mach = vmag / (np.sqrt(T) + eps)
+    p_th = rho * T
+    p_mag = B**2
+    plasma_beta = p_th / (p_mag + eps)
 
-    split_val = np.median(x)
+    log_rho  = np.log10(rho)
+    log_T    = np.log10(T)
+    log_B    = np.log10(B)
+    log_beta = np.log10(np.clip(plasma_beta, eps, None))
+    y = np.log10(si)
 
-    train_mask = x < split_val
-    test_mask  = x >= split_val
+    X = np.column_stack([
+        log_rho, log_T, vx, vy, vz, vmag, log_B, mach, log_beta
+    ])
 
-    def build_features(mask):
-        return np.vstack([
-            rho[mask],
-            T[mask],
-            vx[mask],
-            vy[mask],
-            vz[mask],
-            np.sqrt(vx[mask]**2 + vy[mask]**2 + vz[mask]**2),
-            B[mask]
-        ]).T, si[mask]
+    # Subsample
+    sample_limit = int(os.environ.get('DATASET_SAMPLE_SIZE', 100000))
+    n_total = len(X)
+    if n_total > sample_limit:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(n_total, size=sample_limit, replace=False)
+        X, y, x_pos = X[idx], y[idx], x_pos[idx]
+        print(f"[INFO] Subsampled dataset: {n_total} -> {len(X)} samples")
+    else:
+        print(f"[INFO] Built dataset: {len(X)} samples")
 
-    X_all, y_all = build_features(np.ones_like(rho, dtype=bool))
-    X_train_full, y_train_full = build_features(train_mask)
-    X_test_full,  y_test_full  = build_features(test_mask)
+    return X, y, x_pos
 
-    N_SAMPLES = 60000
 
-    def sample_subset(X, y, N):
-        n = len(X)
-        if n <= N:
-            return X, y
-        idx = rng.choice(n, size=N, replace=False)
-        return X[idx], y[idx]
+def spatial_split(x_pos, strategy='percentile'):
+    """
+    Split data by x-coordinate using specified strategy.
+    
+    Returns
+    -------
+    train_mask, test_mask : boolean arrays
+    gap_info : dict with split statistics
+    """
+    if strategy == 'median':
+        threshold = np.median(x_pos)
+        train_mask = x_pos < threshold
+        test_mask  = x_pos >= threshold
+        gap = 0.0  # no gap
+        
+    elif strategy == 'percentile':
+        # Train on bottom 25%, test on top 25%, discard middle 50%
+        p25 = np.percentile(x_pos, 25)
+        p75 = np.percentile(x_pos, 75)
+        train_mask = x_pos < p25
+        test_mask  = x_pos > p75
+        gap = p75 - p25
+        
+    elif strategy == 'thirds':
+        # Train on bottom 33%, test on top 33%, discard middle
+        p33 = np.percentile(x_pos, 33.33)
+        p67 = np.percentile(x_pos, 66.67)
+        train_mask = x_pos < p33
+        test_mask  = x_pos > p67
+        gap = p67 - p33
+        
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    
+    gap_info = {
+        'strategy': strategy,
+        'gap_size': gap,
+        'n_train': train_mask.sum(),
+        'n_test': test_mask.sum(),
+        'n_discarded': len(x_pos) - train_mask.sum() - test_mask.sum(),
+    }
+    
+    return train_mask, test_mask, gap_info
 
-    X_train, y_train = sample_subset(X_train_full, y_train_full, int(0.8 * N_SAMPLES))
-    X_test, y_test = sample_subset(X_test_full, y_test_full, int(0.2 * N_SAMPLES))
 
-    print(f"Train size: {len(X_train)}, Test size: {len(X_test)}")
-
-    feature_names = ["rho","temperature","velx","vely","velz","v_mag","B_mag"]
-
-    X_train = pd.DataFrame(X_train, columns=feature_names)
-    X_test  = pd.DataFrame(X_test,  columns=feature_names)
-
-    y_train = pd.Series(y_train, name="si_mass_frac")
-    y_test  = pd.Series(y_test,  name="si_mass_frac")
-
+def run_ridge_pipeline(X_tr, y_tr, X_te, y_te):
+    """Unified Ridge pipeline with optional polynomial expansion."""
+    if USE_POLYNOMIAL_FEATURES:
+        print(f"[INFO] Generating polynomial features (degree={POLY_DEGREE})...")
+        poly = PolynomialFeatures(degree=POLY_DEGREE, include_bias=False)
+        X_tr_p = poly.fit_transform(X_tr)
+        X_te_p = poly.transform(X_te)
+        print(f"       Features: {X_tr.shape[1]} -> {X_tr_p.shape[1]}")
+    else:
+        poly = None
+        X_tr_p = X_tr
+        X_te_p = X_te
     
     scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train)
-    X_test_s  = scaler.transform(X_test)
+    X_tr_s = scaler.fit_transform(X_tr_p)
+    X_te_s = scaler.transform(X_te_p)
+    
+    alphas = np.logspace(-5, 2, 20)
+    ridge  = RidgeCV(alphas=alphas, cv=5)
+    ridge.fit(X_tr_s, y_tr)
+    
+    y_pred_te = ridge.predict(X_te_s)
+    y_pred_tr = ridge.predict(X_tr_s)
+    
+    return ridge, scaler, poly, y_pred_tr, y_pred_te
 
 
-    from sklearn.dummy import DummyRegressor
+def train_single_checkpoint_spatial(base_dir, out_dir):
+    """Train Ridge on single checkpoint with spatial hold-out."""
+    os.makedirs(out_dir, exist_ok=True)
+    chk_files = sorted([
+        os.path.join(base_dir, f) 
+        for f in os.listdir(base_dir) 
+        if "ISM_hdf5_chk_" in f
+    ])
+    chk_files = [f for f in chk_files if get_chk_number(f) >= 4]
 
-    dummy = DummyRegressor(strategy="mean")
-    dummy.fit(X_train_s, y_train)
-    print("Dummy R²:", dummy.score(X_test_s, y_test))
+    target_path = chk_files[2] 
+    print(f"[INFO] Loading checkpoint: {target_path}")
+    ds = yt.load(target_path)
 
- 
-    model = Ridge(alpha=0.01)
-    model.fit(X_train_s, y_train)
+    X, y, x_pos = build_dataset_with_coords(ds)
 
-    pred = model.predict(X_test_s)
-    mse = mean_squared_error(y_test, pred)
+    # Apply spatial split
+    train_mask, test_mask, gap_info = spatial_split(x_pos, strategy=SPATIAL_SPLIT_STRATEGY)
+    
+    print(f"\n[INFO] Spatial split strategy: {gap_info['strategy']}")
+    print(f"       Gap between train/test: {gap_info['gap_size']:.3f}")
+    print(f"       Train samples: {gap_info['n_train']}")
+    print(f"       Test samples:  {gap_info['n_test']}")
+    if gap_info['n_discarded'] > 0:
+        print(f"       Discarded (middle): {gap_info['n_discarded']}")
 
-    print(f"Trained Ridge on {len(X_train)} samples; MSE={mse:.6e}")
-    print(f"RIDGE R²: {model.score(X_test_s, y_test):.4f}")
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_test,  y_test  = X[test_mask],  y[test_mask]
 
-   
-    # ----------------------------------------
-    y_true = np.array(y_test)
-    y_pred = np.array(pred)
-
-    nplot = min(len(y_true), 10)
-    order = np.arange(len(y_true))
-    if len(order) > nplot:
-        rng = np.random.default_rng(1)
-        order = rng.choice(order, size=nplot, replace=False)
-
-    plt.figure(figsize=(10,5))
-    plt.scatter(order, y_true[order], s=8, alpha=0.7, label='True')
-    plt.scatter(order, y_pred[order], s=8, alpha=0.6, label='Predicted')
-    plt.xlabel('Sample index')
-    plt.ylabel('Si mass fraction')
-    plt.title(f'Si: True vs Predicted (MSE={mse:.2e})')
-    plt.legend()
-    plt.grid(alpha=0.3)
-
-    out_fig = "siresults/latestage_si_true_and_pred_series.png"
-    plt.tight_layout()
-    plt.savefig(out_fig, dpi=200)
-    print(f"Saved plot to: {out_fig}")
-
-
-    out_model = "siresults/latestage_si_ridge_model.npz"
-    np.savez_compressed(
-        out_model,
-        coef=model.coef_,
-        intercept=model.intercept_,
-        features=feature_names
-    )
-    print(f"Saved model to: {out_model}")
-
-    # save dataframe (NO leakage now — already split correctly)
-    df_train = X_train.copy()
-    df_train["si_mass_frac"] = y_train.values
-
-    df_test = X_test.copy()
-    df_test["si_mass_frac"] = y_test.values
-
-    np.savez_compressed(
-        "siresults/train_data.npz",
-        **{col: df_train[col].values for col in df_train.columns}
+    model, scaler, poly, _, y_pred = run_ridge_pipeline(
+        X_train, y_train, X_test, y_test
     )
 
-    np.savez_compressed(
-        "siresults/test_data.npz",
-        **{col: df_test[col].values for col in df_test.columns}
+    mse = mean_squared_error(y_test, y_pred)
+    r2  = r2_score(y_test, y_pred)
+    
+    print(f"\n[INFO] Best alpha: {model.alpha_:.2e}")
+    print(f"[RESULT] Single-checkpoint (spatial hold-out)")
+    print(f"         Polynomial features: {USE_POLYNOMIAL_FEATURES}")
+    print(f"         MSE: {mse:.6e}")
+    print(f"         R²:  {r2:.4f}")
+
+    # Save
+    joblib.dump(model,  os.path.join(out_dir, "ridge_single_spatial.joblib"))
+    joblib.dump(scaler, os.path.join(out_dir, "scaler_single_spatial.joblib"))
+    if poly is not None:
+        joblib.dump(poly, os.path.join(out_dir, "poly_single_spatial.joblib"))
+    
+    np.savez(
+        os.path.join(out_dir, "single_spatial_test.npz"),
+        y_true=y_test,
+        y_pred=y_pred,
+        X=X_test
+    )
+    
+    # Save split info for reproducibility
+    with open(os.path.join(out_dir, "split_info.txt"), "w") as f:
+        f.write(f"Strategy: {gap_info['strategy']}\n")
+        f.write(f"Gap size: {gap_info['gap_size']:.3f}\n")
+        f.write(f"Train samples: {gap_info['n_train']}\n")
+        f.write(f"Test samples: {gap_info['n_test']}\n")
+        f.write(f"Discarded: {gap_info['n_discarded']}\n")
+        f.write(f"R²: {r2:.4f}\n")
+        f.write(f"RMSE: {np.sqrt(mse):.4f} dex\n")
+    
+    print(f"[SUCCESS] Saved to {out_dir}/")
+
+
+def train_multi_checkpoint(base_dir, out_dir):
+    """Train Ridge on early checkpoint, test on late checkpoint."""
+    os.makedirs(out_dir, exist_ok=True)
+    chk_files = sorted([
+        os.path.join(base_dir, f) 
+        for f in os.listdir(base_dir) 
+        if "ISM_hdf5_chk_" in f
+    ])
+    chk_files = [f for f in chk_files if get_chk_number(f) >= 4]
+
+    early_path = chk_files[0]  
+    late_path  = chk_files[-1]  
+
+    print(f"[INFO] Train checkpoint: {early_path}")
+    print(f"[INFO] Test  checkpoint: {late_path}")
+
+    ds_train = yt.load(early_path)
+    ds_test  = yt.load(late_path)
+
+    X_train, y_train, _ = build_dataset_with_coords(ds_train)
+    X_test,  y_test,  _ = build_dataset_with_coords(ds_test)
+
+    print(f"[INFO] Train: {len(X_train)} samples")
+    print(f"[INFO] Test:  {len(X_test)} samples")
+
+    model, scaler, poly, y_pred_train, y_pred_test = run_ridge_pipeline(
+        X_train, y_train, X_test, y_test
     )
 
-    print("Saved train/test datasets separately (leakage-safe)")
+    mse = mean_squared_error(y_test, y_pred_test)
+    r2  = r2_score(y_test, y_pred_test)
+    
+    print(f"\n[INFO] Best alpha: {model.alpha_:.2e}")
+    print(f"[RESULT] Multi-checkpoint (temporal generalization)")
+    print(f"         Polynomial features: {USE_POLYNOMIAL_FEATURES}")
+    print(f"         MSE: {mse:.6e}")
+    print(f"         R²:  {r2:.4f}")
 
-    # save scaler
-    scaler_path = "siresults/latestage_si_scaler.joblib"
-    joblib.dump(scaler, scaler_path)
-    print(f"Saved feature scaler to: {scaler_path}")
+    joblib.dump(model,  os.path.join(out_dir, "ridge_multi_checkpoint.joblib"))
+    joblib.dump(scaler, os.path.join(out_dir, "scaler_multi_checkpoint.joblib"))
+    if poly is not None:
+        joblib.dump(poly, os.path.join(out_dir, "poly_multi_checkpoint.joblib"))
+    
+    np.savez(
+        os.path.join(out_dir, "multi_checkpoint_test.npz"),
+        X=X_test,
+        y_true=y_test,
+        y_pred=y_pred_test
+    )
+    np.savez(
+        os.path.join(out_dir, "multi_checkpoint_train.npz"),
+        X=X_train,
+        y_true=y_train,
+        y_pred=y_pred_train
+    )
+    print(f"[SUCCESS] Saved to {out_dir}/")
+
 
 if __name__ == "__main__":
-    main()
+    BASE_DIR = "/scratch/ebuie/ISO_Turb/midway/mhd_1e8/1E23_S100_z1_mhd/"
+    OUT_DIR  = os.environ.get("OUT_DIR_OVERRIDE") or (
+        "siresults_ridge_fixed" if ION_FIELD == "si  "
+        else f"results_{ION_TAG}_ridge")
+
+    print("=" * 70)
+    print(f"CONFIG: Ion = {ION_TAG} (field {ION_FIELD!r})")
+    print(f"CONFIG: Polynomial features = {USE_POLYNOMIAL_FEATURES}")
+    print(f"        Spatial split = {SPATIAL_SPLIT_STRATEGY}")
+    print("=" * 70)
+    
+    print("\nMODE 1 — Single-checkpoint with spatial hold-out")
+    print("=" * 70)
+    train_single_checkpoint_spatial(BASE_DIR, OUT_DIR)
+
+    # print("\n" + "=" * 70)
+    # print("MODE 2 — Multi-checkpoint temporal generalization")
+    # print("=" * 70)
+    # train_multi_checkpoint(BASE_DIR, OUT_DIR)
