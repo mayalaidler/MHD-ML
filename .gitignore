@@ -1,0 +1,9 @@
+mhd_1e8/
+__pycache__/
+*.pyc
+*.swp
+ml/logs/
+ml/backups_*/
+*.npz
+*.joblib
+!ml/final_results/**/*.json
